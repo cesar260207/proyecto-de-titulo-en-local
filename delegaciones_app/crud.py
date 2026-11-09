@@ -1,0 +1,622 @@
+"""Mantenedores de las doce tablas maestras.
+
+Cada mantenedor se describe una sola vez en MANTENEDORES (modelo, formulario, columnas, búsqueda).
+Las cuatro vistas genéricas (lista, nuevo, editar y eliminar) leen esa descripción, así
+que no se repite código por tabla. Cada vista exige el permiso de Django del modelo que le corresponde
+(view, add, change o delete), que el usuario recibe por su perfil (grupo).
+
+Eliminar borra la fila si no tiene datos relacionados. En las tablas con campo de baja (delegaciones, cargos,
+funcionarios y catálogo), si la fila tiene datos relacionados se desactiva en su lugar, para no perder el
+historial, y la confirmación explica cuáles son esos datos.
+"""
+import datetime
+import csv
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+from django.contrib import messages
+from django.contrib.auth.models import Group
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import CASCADE, ProtectedError, Q
+from django.http import Http404, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.views import View
+from django.views.generic import CreateView, DeleteView, ListView, UpdateView
+
+from .auditoria import cambios_de_formulario
+from .forms import AjusteForm, AusenciaForm, CargoForm, CatalogoForm, DelegacionForm, FuncionarioForm, ItemMedibleForm, MetaForm, OrganizacionForm, ParametroVersionadoForm, PeriodoForm, RolForm
+from .models import Ajuste, Auditoria, Ausencia, Cargo, Catalogo, Delegacion, Funcionario, Indicador, ItemMedible, Meta, Organizacion, ParametroVersionado, Periodo, Rol
+from .permisos import PERFILES, ROLES_DEL_SISTEMA, PermisoRequeridoMixin, funcionario_de, permiso_requerido
+
+
+@dataclass
+class Mantenedor:
+    slug: str
+    titulo: str
+    singular: str
+    descripcion: str
+    modelo: type
+    form: type
+    columnas: list  # (etiqueta, nombre de atributo o función del objeto)
+    busqueda: tuple
+    baja: str = ''  # campo booleano: si la fila tiene datos relacionados se desactiva en vez de eliminarse
+    select_related: tuple = ()
+    prefetch_related: tuple = ()
+    con_actor: bool = False  # el formulario necesita saber quién lo usa
+    ayuda: str = ''
+    cambiar_baja: Optional[Callable] = None  # (objeto, nuevo_valor)
+    bloqueo: Optional[Callable] = None  # (objeto, request) -> motivo o None
+    advertencia_eliminar: Optional[Callable] = None  # (objeto) -> texto o None
+    eliminar: Optional[Callable] = None  # (objeto) elimina la fila y lo que depende de ella
+    despues_de_guardar: Optional[Callable] = None  # (objeto)
+    acciones_fila: Optional[Callable] = None  # (objeto) -> lista de acciones extra
+
+    @property
+    def entidad(self):
+        return self.modelo.__name__
+
+    def consulta(self):
+        return self.modelo.objects.select_related(*self.select_related).prefetch_related(*self.prefetch_related)
+
+    def permiso(self, accion):
+        """Permiso de Django para una acción (view, add, change o delete) sobre el modelo."""
+        return f'{self.modelo._meta.app_label}.{accion}_{self.modelo._meta.model_name}'
+
+    def permisos_de(self, user):
+        return {accion: user.has_perm(self.permiso(accion)) for accion in ('view', 'add', 'change', 'delete')}
+
+
+# Comportamiento propio de cada mantenedor
+
+def _cambiar_delegacion(delegacion, activa):
+    delegacion.set_estado(activa)
+
+
+def _cambiar_catalogo(elemento, activo):
+    if activo:
+        elemento.activar()
+    else:
+        elemento.desactivar()
+
+
+def _cambiar_funcionario(funcionario, activo):
+    funcionario.estado = activo
+    funcionario.save(update_fields=['estado'])
+    funcionario.usuario.is_active = activo
+    funcionario.usuario.save(update_fields=['is_active'])
+
+
+def _bloqueo_funcionario(funcionario, request):
+    if funcionario.usuario_id == request.user.pk and funcionario.estado:
+        return 'No puedes eliminar ni desactivar tu propia cuenta.'
+
+
+def _advertencia_funcionario(funcionario):
+    return f'También se elimina su cuenta de acceso «{funcionario.usuario.username}».'
+
+
+def _eliminar_funcionario(funcionario):
+    usuario = funcionario.usuario
+    funcionario.delete()  # sus roles asignados (funcionario_rol) se borran en cascada
+    usuario.delete()
+
+
+def _bloqueo_rol(rol, request):
+    if rol.nombre_rol in ROLES_DEL_SISTEMA:
+        return f'«{rol}» es un rol del sistema: los permisos lo consultan por su nombre y no se elimina.'
+
+
+def _advertencia_meta(meta):
+    total = meta.indicadores.count()
+    if total:
+        return f'También se eliminarán los {total} indicador(es) calculados para esta meta.'
+
+
+def _generar_indicador(meta):
+    Indicador.generar(meta)
+
+
+def _acciones_periodo(periodo):
+    def accion(nombre, etiqueta, motivo=False):
+        return {'url': reverse('periodo_accion', args=[periodo.pk, nombre]), 'etiqueta': etiqueta, 'motivo': motivo}
+
+    if periodo.estado == 'borrador':
+        return [accion('iniciar', 'Iniciar')]
+    if periodo.estado == 'abierto':
+        return [accion('cerrar', 'Cerrar')]
+    return [accion('reabrir', 'Reabrir', motivo=True)]
+
+
+MANTENEDORES = {mantenedor.slug: mantenedor for mantenedor in (
+    Mantenedor(
+        'delegaciones', 'Delegaciones', 'delegación', 'Unidades territoriales y su estado operativo.',
+        Delegacion, DelegacionForm,
+        [('Nombre', 'nombre'), ('Ámbito', 'ambito'), ('Énfasis', lambda d: (d.enfasis or '')[:90]), ('Funcionarios', lambda d: d.funcionarios.count()), ('Organizaciones', lambda d: d.organizaciones.count())],
+        ('nombre__icontains', 'ambito__icontains', 'enfasis__icontains'),
+        baja='estado', cambiar_baja=_cambiar_delegacion,
+    ),
+    Mantenedor(
+        'cargos', 'Cargos', 'cargo', 'Cargos de los funcionarios y su vigencia.',
+        Cargo, CargoForm,
+        [('Nombre', 'nombre')],
+        ('nombre__icontains',),
+        baja='vigencia',
+    ),
+    Mantenedor(
+        'roles', 'Roles', 'rol', 'Funciones de los funcionarios en el flujo de trabajo (delegado, verificador, consulta...).',
+        Rol, RolForm,
+        [('Rol', 'nombre_rol'), ('Funcionarios', lambda r: r.funcionarios.count())],
+        ('nombre_rol__icontains',),
+        bloqueo=_bloqueo_rol,
+    ),
+    Mantenedor(
+        'funcionarios', 'Funcionarios y usuarios', 'funcionario', 'Cuentas de acceso con su perfil, cargo, delegación y roles.',
+        Funcionario, FuncionarioForm,
+        [
+            ('Nombre', 'nombre'), ('Usuario', 'identificador_institucional'), ('Correo', lambda f: f.usuario.email), ('Cargo', 'cargo'), ('Delegación', 'delegacion'),
+            ('Perfil', lambda f: ', '.join(grupo.name for grupo in f.usuario.groups.all() if grupo.name in PERFILES)),
+            ('Roles', lambda f: ', '.join(rol.nombre_rol for rol in f.roles.all())),
+        ],
+        ('nombre__icontains', 'identificador_institucional__icontains', 'usuario__email__icontains', 'cargo__nombre__icontains', 'delegacion__nombre__icontains', 'roles__nombre_rol__icontains', 'usuario__groups__name__icontains'),
+        baja='estado', select_related=('cargo', 'delegacion', 'usuario'), prefetch_related=('roles', 'usuario__groups'),
+        con_actor=True, cambiar_baja=_cambiar_funcionario, bloqueo=_bloqueo_funcionario,
+        advertencia_eliminar=_advertencia_funcionario, eliminar=_eliminar_funcionario,
+        ayuda='Al crear un funcionario también se crea su cuenta de acceso y se le asigna su perfil (grupo). Al editar, deja la contraseña vacía para conservarla. El correo se usa para recuperar la contraseña.',
+    ),
+    Mantenedor(
+        'catalogo', 'Catálogo', 'elemento de catálogo', 'Actividades, servicios, tipos de atención e ítems normalizados.',
+        Catalogo, CatalogoForm,
+        [('Tipo', 'get_tipo_display'), ('Código', 'codigo'), ('Nombre', 'nombre'), ('Área', 'area')],
+        ('codigo__icontains', 'nombre__icontains', 'tipo__icontains', 'area__icontains'),
+        baja='activo', cambiar_baja=_cambiar_catalogo,
+    ),
+    Mantenedor(
+        'organizaciones', 'Organizaciones comunitarias', 'organización comunitaria', 'Registro territorial de organizaciones importadas y verificadas.',
+        Organizacion, OrganizacionForm,
+        [('Nombre', 'nombre'), ('Tipo', 'get_tipo_display'), ('Territorio', 'territorio'), ('Delegación', 'delegacion'), ('Verificada', 'verificada')],
+        ('nombre__icontains', 'territorio__icontains', 'personalidad_juridica__icontains', 'delegacion__nombre__icontains'),
+        baja='activa', select_related=('delegacion',),
+    ),
+    Mantenedor(
+        'periodos', 'Períodos', 'período', 'Ventanas de medición y su umbral colectivo.',
+        Periodo, PeriodoForm,
+        [('Nombre', 'nombre'), ('Inicio', 'fecha_inicio'), ('Término', 'fecha_termino'), ('Días', 'dias_computables'), ('Umbral (%)', 'umbral_minimo'), ('Estado', 'get_estado_display')],
+        ('nombre__icontains', 'estado__icontains'),
+        acciones_fila=_acciones_periodo,
+        ayuda='El término debe ser igual o posterior al inicio. El estado cambia con las acciones Iniciar, Cerrar y Reabrir de la lista.',
+    ),
+    Mantenedor(
+        'parametros', 'Parámetros del período', 'parámetro', 'Valores versionados que controlan reglas y cálculos.',
+        ParametroVersionado, ParametroVersionadoForm,
+        [('Período', 'periodo'), ('Clave', 'clave'), ('Valor', 'valor'), ('Descripción', 'descripcion')],
+        ('clave__icontains', 'valor__icontains', 'periodo__nombre__icontains'),
+        select_related=('periodo',),
+    ),
+    Mantenedor(
+        'items', 'Ítems medibles', 'ítem medible', 'Ítems evaluados por cargo y período, con su ponderación.',
+        ItemMedible, ItemMedibleForm,
+        [('Nombre', 'nombre'), ('Cargo', 'cargo'), ('Período', 'periodo'), ('Servicio', 'servicio'), ('Ponderación (%)', 'ponderacion')],
+        ('nombre__icontains', 'servicio__icontains', 'cargo__nombre__icontains', 'periodo__nombre__icontains'),
+        select_related=('cargo', 'periodo'),
+    ),
+    Mantenedor(
+        'metas', 'Metas', 'meta', 'Objetivos de cada funcionario por ítem medible.',
+        Meta, MetaForm,
+        [
+            ('Ítem', lambda m: m.item.nombre), ('Período', lambda m: m.item.periodo), ('Funcionario', 'funcionario'),
+            ('Delegación', lambda m: m.funcionario.delegacion), ('Objetivo', 'valor_objetivo'), ('Unidad', 'unidad'), ('Ponderador (%)', 'ponderador'),
+        ],
+        ('item__nombre__icontains', 'funcionario__nombre__icontains', 'funcionario__delegacion__nombre__icontains'),
+        select_related=('item__periodo', 'funcionario__delegacion'),
+        advertencia_eliminar=_advertencia_meta, despues_de_guardar=_generar_indicador,
+    ),
+    Mantenedor(
+        'ajustes', 'Ajustes', 'ajuste', 'Felicitaciones y reclamos formales aplicables a funcionarios o delegaciones.',
+        Ajuste, AjusteForm,
+        [
+            ('Tipo', 'get_tipo_display'), ('Origen', 'get_origen_display'), ('Emisor', 'emisor'),
+            ('Funcionario', 'funcionario'), ('Delegación', 'delegacion'), ('Período', 'periodo'),
+            ('Fecha', 'fecha'), ('Estado', 'get_estado_display'),
+        ],
+        ('tipo__icontains', 'origen__icontains', 'emisor__icontains', 'funcionario__nombre__icontains', 'delegacion__nombre__icontains', 'periodo__nombre__icontains'),
+        select_related=('funcionario', 'delegacion', 'periodo'),
+    ),
+    Mantenedor(
+        'ausencias', 'Ausencias', 'ausencia', 'Períodos de ausencia que ajustan el avance esperado.',
+        Ausencia, AusenciaForm,
+        [
+            ('Funcionario', 'funcionario'), ('Período', 'periodo'), ('Tipo', 'tipo'),
+            ('Desde', 'desde'), ('Hasta', 'hasta'), ('Observación', 'observacion'),
+        ],
+        ('funcionario__nombre__icontains', 'periodo__nombre__icontains', 'tipo__icontains', 'observacion__icontains'),
+        select_related=('funcionario', 'periodo'),
+    ),
+)}
+
+
+# Utilidades de presentación y auditoría
+
+def exportar_organizaciones(request):
+    if not request.user.has_perm('delegaciones_app.view_organizacion'):
+        raise Http404('Mantenedor no encontrado.')
+    registros = Organizacion.objects.select_related('delegacion').order_by('nombre')
+    query = request.GET.get('q', '').strip()
+    if query:
+        filtros = Q()
+        for campo in MANTENEDORES['organizaciones'].busqueda:
+            filtros |= Q(**{campo: query})
+        registros = registros.filter(filtros).distinct()
+    tipo = request.GET.get('tipo', '').strip()
+    delegacion = request.GET.get('delegacion', '').strip()
+    verificada = request.GET.get('verificada', '').strip()
+    orden = request.GET.get('orden', '').strip()
+    if tipo:
+        registros = registros.filter(tipo=tipo)
+    if delegacion:
+        registros = registros.filter(delegacion_id=delegacion)
+    if verificada in ('si', 'no'):
+        registros = registros.filter(verificada=verificada == 'si')
+    if orden in ('nombre', '-nombre', 'territorio', '-territorio'):
+        registros = registros.order_by(orden)
+    respuesta = HttpResponse(content_type='text/csv; charset=utf-8')
+    respuesta['Content-Disposition'] = 'attachment; filename="organizaciones_filtradas.csv"'
+    respuesta.write('\ufeff')
+    escritor = csv.writer(respuesta)
+    escritor.writerow(['Nombre', 'Tipo', 'Territorio', 'Delegación', 'Verificada', 'Domicilio'])
+    for organizacion in registros:
+        escritor.writerow([
+            organizacion.nombre, organizacion.get_tipo_display(), organizacion.territorio,
+            organizacion.delegacion.nombre if organizacion.delegacion else '', 'Sí' if organizacion.verificada else 'No',
+            organizacion.domicilio,
+        ])
+    return respuesta
+
+def _texto(objeto, acceso):
+    valor = acceso(objeto) if callable(acceso) else getattr(objeto, acceso)
+    if callable(valor):  # por ejemplo get_tipo_display
+        valor = valor()
+    if isinstance(valor, bool):
+        return 'Sí' if valor else 'No'
+    if isinstance(valor, datetime.date):
+        return valor.strftime('%d-%m-%Y')
+    if valor is None or valor == '':
+        return '-'
+    return str(valor)
+
+
+def _auditar(request, config, accion, objeto, anterior=None, nuevo=None):
+    Auditoria.registrar_evento(request.user, accion, config.entidad, objeto.pk, anterior, nuevo)
+
+
+def datos_relacionados(objeto):
+    """Registros de otras tablas que apuntan al objeto, como [('actividades', 3), ('funcionario', 1)]. No cuenta
+    lo que se borra junto con el objeto (on_delete=CASCADE, como los roles asignados a un funcionario)."""
+    relacionados = []
+    for relacion in objeto._meta.related_objects:
+        if relacion.many_to_many or relacion.on_delete is CASCADE:
+            continue
+        total = relacion.related_model._default_manager.filter(**{relacion.field.name: objeto}).count()
+        if total:
+            opciones = relacion.related_model._meta
+            relacionados.append((opciones.verbose_name if total == 1 else opciones.verbose_name_plural, total))
+    return relacionados
+
+
+def texto_relacionados(relacionados):
+    return ', '.join(f'{total} {nombre}' for nombre, total in relacionados)
+
+
+def _motivo_de_proteccion(error):
+    cuentas = {}
+    for objeto in error.protected_objects:
+        nombre = objeto._meta.verbose_name_plural
+        cuentas[nombre] = cuentas.get(nombre, 0) + 1
+    return ', '.join(f'{total} {nombre}' for nombre, total in cuentas.items())
+
+
+# Vistas genéricas
+
+class MantenedorMixin(PermisoRequeridoMixin):
+    """Busca el mantenedor por el slug de la URL y exige el permiso de la acción sobre su modelo."""
+
+    accion = 'view'
+
+    def setup(self, request, *args, **kwargs):
+        super().setup(request, *args, **kwargs)
+        self.config = MANTENEDORES.get(kwargs.get('slug'))
+        if self.config is None:
+            raise Http404('Mantenedor no encontrado.')
+
+    def get_permiso_requerido(self):
+        return self.config.permiso(self.accion)
+
+    def get_queryset(self):
+        return self.config.consulta()
+
+    def get_context_data(self, **kwargs):
+        contexto = super().get_context_data(**kwargs)
+        contexto.update(config=self.config, volver_url=self.url_lista(), puede=self.config.permisos_de(self.request.user))
+        return contexto
+
+    def url_lista(self):
+        return reverse('mantenedor_lista', args=[self.config.slug])
+
+    def get_success_url(self):
+        return self.url_lista()
+
+
+class MantenedorLista(MantenedorMixin, ListView):
+    template_name = 'delegaciones_app/crud/lista.html'
+    paginate_by = 50
+
+    def get_queryset(self):
+        registros = super().get_queryset()
+        self.query = self.request.GET.get('q', '').strip()
+        self.organizacion_filtros = {
+            'tipo': self.request.GET.get('tipo', '').strip(),
+            'delegacion': self.request.GET.get('delegacion', '').strip(),
+            'verificada': self.request.GET.get('verificada', '').strip(),
+        }
+        self.delegacion_estado = self.request.GET.get('estado', '').strip()
+        self.orden = self.request.GET.get('orden', '').strip()
+        if self.query:
+            filtros = Q()
+            for campo in self.config.busqueda:
+                filtros |= Q(**{campo: self.query})
+            registros = registros.filter(filtros).distinct()
+        if self.config.slug == 'organizaciones':
+            if self.organizacion_filtros['tipo']:
+                registros = registros.filter(tipo=self.organizacion_filtros['tipo'])
+            if self.organizacion_filtros['delegacion']:
+                registros = registros.filter(delegacion_id=self.organizacion_filtros['delegacion'])
+            if self.organizacion_filtros['verificada'] in ('si', 'no'):
+                registros = registros.filter(verificada=self.organizacion_filtros['verificada'] == 'si')
+        elif self.config.slug == 'delegaciones' and self.delegacion_estado in ('activas', 'inactivas'):
+            registros = registros.filter(estado=self.delegacion_estado == 'activas')
+        if self.orden in ('nombre', '-nombre', 'territorio', '-territorio'):
+            campo = 'territorio' if self.config.slug == 'organizaciones' and self.orden.lstrip('-') == 'territorio' else 'nombre'
+            registros = registros.order_by(('-' if self.orden.startswith('-') else '') + campo)
+        return registros
+
+    def get_context_data(self, **kwargs):
+        contexto = super().get_context_data(**kwargs)
+        config = self.config
+        contexto['query'] = self.query
+        contexto['cantidad_resultados'] = contexto['paginator'].count if contexto.get('paginator') else len(contexto['object_list'])
+        contexto['orden'] = self.orden
+        contexto['delegacion_estado'] = self.delegacion_estado
+        querystring = self.request.GET.copy()
+        querystring.pop('page', None)
+        contexto['querystring'] = querystring.urlencode()
+        if config.slug == 'organizaciones':
+            contexto['organizacion_filtros'] = self.organizacion_filtros
+            contexto['tipos_organizacion'] = Organizacion.TIPOS
+            contexto['delegaciones_filtro'] = Delegacion.objects.filter(estado=True).order_by('nombre')
+            contexto['ordenes'] = (('nombre', 'Nombre A-Z'), ('-nombre', 'Nombre Z-A'), ('territorio', 'Territorio A-Z'), ('-territorio', 'Territorio Z-A'))
+        if config.slug == 'delegaciones':
+            contexto['ordenes'] = (('nombre', 'Nombre A-Z'), ('-nombre', 'Nombre Z-A'))
+        contexto['columnas'] = [etiqueta for etiqueta, _ in config.columnas]
+        contexto['total_columnas'] = len(config.columnas) + 1 + bool(config.baja)
+        contexto['filas'] = [
+            {
+                'pk': registro.pk,
+                'valores': [_texto(registro, acceso) for _, acceso in config.columnas],
+                'activo': getattr(registro, config.baja) if config.baja else None,
+                'acciones': config.acciones_fila(registro) if config.acciones_fila else [],
+            }
+            for registro in contexto['object_list']
+        ]
+        return contexto
+
+
+class MantenedorFormularioMixin(MantenedorMixin):
+    template_name = 'delegaciones_app/mantenedor_form.html'
+    accion_titulo = ''
+
+    def get_form_class(self):
+        return self.config.form
+
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        if self.config.con_actor:
+            kwargs['actor'] = self.request.user
+        return kwargs
+
+    def get_context_data(self, **kwargs):
+        contexto = super().get_context_data(**kwargs)
+        contexto.update(titulo=f'{self.accion_titulo} {self.config.singular}', ayuda=self.config.ayuda)
+        return contexto
+
+    def form_valid(self, form):
+        editando = form.instance.pk is not None
+        if isinstance(form.instance, (Ajuste, Ausencia)) and not form.instance.pk:
+            actor = funcionario_de(self.request.user)
+            if actor is None:
+                messages.error(self.request, 'No se encontró un funcionario asociado a tu cuenta.')
+                return redirect(self.get_success_url())
+            if isinstance(form.instance, Ajuste) and not form.instance.pk:
+                form.instance.informado_por = actor
+            elif isinstance(form.instance, Ausencia) and not form.instance.pk:
+                form.instance.registrada_por = actor
+        anterior, nuevo = cambios_de_formulario(form, getattr(form, 'campos_sin_auditar', ()))
+        with transaction.atomic():
+            respuesta = super().form_valid(form)
+            _auditar(self.request, self.config, 'editar' if editando else 'crear', self.object, anterior, nuevo)
+            if self.config.despues_de_guardar:
+                self.config.despues_de_guardar(self.object)
+        messages.success(self.request, f'Se guardó: {self.object}.')
+        return respuesta
+
+
+class MantenedorNuevo(MantenedorFormularioMixin, CreateView):
+    accion = 'add'
+    accion_titulo = 'Agregar'
+
+
+class MantenedorEditar(MantenedorFormularioMixin, UpdateView):
+    accion = 'change'
+    accion_titulo = 'Modificar'
+
+
+class MantenedorEliminar(MantenedorMixin, DeleteView):
+    """Confirma y elimina la fila. En los mantenedores con `baja`, una fila con datos relacionados no se
+    elimina: se desactiva y la confirmación explica la razón. Una fila inactiva se vuelve a activar."""
+
+    accion = 'delete'
+    template_name = 'delegaciones_app/mantenedor_confirmar_eliminar.html'
+    SUSTANTIVOS = {'eliminar': 'eliminación', 'desactivar': 'desactivación', 'activar': 'activación'}
+
+    def _bloqueo(self):
+        return self.config.bloqueo(self.object, self.request) if self.config.bloqueo else None
+
+    def _decision(self):
+        """Qué hará la confirmación ('eliminar', 'desactivar' o 'activar') y los datos relacionados que la explican.
+        Se calcula de nuevo al confirmar, por si la fila ganó datos relacionados mientras tanto."""
+        config, objeto = self.config, self.object
+        if not config.baja:
+            return 'eliminar', []
+        if not getattr(objeto, config.baja):
+            return 'activar', []
+        relacionados = datos_relacionados(objeto)
+        return ('desactivar' if relacionados else 'eliminar'), relacionados
+
+    def _advertencia(self, decision, relacionados):
+        config, objeto = self.config, self.object
+        if decision == 'activar':
+            return None
+        if decision == 'desactivar':
+            return (f'No se puede eliminar porque tiene datos relacionados: {texto_relacionados(relacionados)}. '
+                    'Se desactivará: la fila se conserva con su historial y se puede volver a activar.')
+        extra = config.advertencia_eliminar(objeto) if config.advertencia_eliminar else None
+        if config.baja:
+            return ' '.join(filter(None, ('No tiene datos relacionados: se eliminará definitivamente.', extra, 'Esta acción no se puede deshacer.')))
+        return extra or 'Esta acción no se puede deshacer.'
+
+    def get_context_data(self, **kwargs):
+        contexto = super().get_context_data(**kwargs)
+        decision, relacionados = self._decision()
+        contexto.update(
+            objeto=self.object, titulo=f'{decision.capitalize()} {self.config.singular}',
+            advertencia=self._advertencia(decision, relacionados),
+            pregunta=f'¿Confirmas {decision}', boton=f'Confirmar {self.SUSTANTIVOS[decision]}', bloqueo=self._bloqueo(),
+            peligro=decision != 'activar',
+        )
+        return contexto
+
+    def form_valid(self, form):
+        motivo = self._bloqueo()
+        if motivo:
+            messages.error(self.request, motivo)
+            return redirect(self.get_success_url())
+        decision, relacionados = self._decision()
+        if decision == 'eliminar':
+            return self._eliminar(self.object)
+        return self._cambiar_baja(self.object, relacionados)
+
+    def _cambiar_baja(self, objeto, relacionados):
+        config = self.config
+        activar = not getattr(objeto, config.baja)
+        with transaction.atomic():
+            if config.cambiar_baja:
+                config.cambiar_baja(objeto, activar)
+            else:
+                setattr(objeto, config.baja, activar)
+                objeto.save(update_fields=[config.baja])
+            _auditar(self.request, config, 'activar' if activar else 'desactivar', objeto, {config.baja: not activar}, {config.baja: activar})
+        if activar:
+            messages.success(self.request, f'{objeto}: activado.')
+        else:
+            messages.success(self.request, f'{objeto}: desactivado. No se eliminó porque tiene datos relacionados: {texto_relacionados(relacionados)}.')
+        return redirect(self.get_success_url())
+
+    def _eliminar(self, objeto):
+        descripcion = str(objeto)
+        try:
+            with transaction.atomic():
+                _auditar(self.request, self.config, 'eliminar', objeto, {'descripcion': descripcion})
+                if self.config.eliminar:
+                    self.config.eliminar(objeto)
+                else:
+                    objeto.delete()
+        except ProtectedError as error:
+            messages.error(self.request, f'No se puede eliminar «{descripcion}» porque tiene registros asociados: {_motivo_de_proteccion(error)}.')
+        except ValidationError as error:
+            messages.error(self.request, ' '.join(error.messages))
+        else:
+            messages.success(self.request, f'Se eliminó: {descripcion}.')
+        return redirect(self.get_success_url())
+
+
+class PeriodoAccion(PermisoRequeridoMixin, View):
+    """Iniciar, cerrar y reabrir un período (las reglas están en los métodos del modelo)."""
+
+    permiso_requerido = 'delegaciones_app.change_periodo'
+    ACCIONES = {'iniciar': 'iniciado', 'cerrar': 'cerrado', 'reabrir': 'reabierto'}
+
+    def post(self, request, pk, accion):
+        if accion not in self.ACCIONES:
+            raise Http404('Acción no válida.')
+        periodo = get_object_or_404(Periodo, pk=pk)
+        try:
+            with transaction.atomic():
+                if accion == 'iniciar':
+                    periodo.iniciar_periodo()
+                elif accion == 'cerrar':
+                    periodo.cerrar_periodo()
+                else:
+                    periodo.reabrir_periodo(request.POST.get('motivo', ''), request.user)
+                if accion != 'reabrir':  # reabrir_periodo ya deja su propio registro de auditoría
+                    Auditoria.registrar_evento(request.user, f'{accion}_periodo', 'Periodo', periodo.pk, None, {'estado': periodo.estado})
+        except ValidationError as error:
+            messages.error(request, ' '.join(error.messages))
+        else:
+            messages.success(request, f'Período «{periodo}» {self.ACCIONES[accion]}.')
+        return redirect('mantenedor_lista', slug='periodos')
+
+
+def mantenedores_visibles(user):
+    """Tarjetas de los doce mantenedores con lo que el usuario puede hacer en cada uno según sus permisos."""
+    return [
+        {'slug': m.slug, 'titulo': m.titulo, 'descripcion': m.descripcion, 'permitido': user.has_perm(m.permiso('view')), 'puede': m.permisos_de(user)}
+        for m in MANTENEDORES.values()
+    ]
+
+
+PERMISOS_DE_MANTENEDORES = tuple(m.permiso('view') for m in MANTENEDORES.values())
+
+
+@permiso_requerido(*PERMISOS_DE_MANTENEDORES)
+def indice(request):
+    """Índice de los doce mantenedores; los que el usuario no puede usar aparecen deshabilitados."""
+    return render(request, 'delegaciones_app/mantenedores.html', {
+        'tarjetas': mantenedores_visibles(request.user),
+        'puede_auditar': request.user.has_perm('delegaciones_app.view_auditoria'),
+        'puede_ver_perfiles': request.user.has_perm('auth.view_group'),
+    })
+
+
+ACCIONES_PERMISO = {'view': 'Ver', 'add': 'Agregar', 'change': 'Modificar', 'delete': 'Eliminar'}
+
+
+@permiso_requerido('auth.view_group')
+def perfiles(request):
+    """Perfiles de acceso (grupos de Django) con sus permisos y sus usuarios. Es de solo lectura:
+    el perfil de cada usuario se asigna en el mantenedor de funcionarios."""
+    filas = []
+    for grupo in Group.objects.filter(name__in=PERFILES).prefetch_related('permissions__content_type'):
+        por_modelo = {}
+        for permiso in grupo.permissions.all():
+            accion, _, _ = permiso.codename.partition('_')
+            modelo = permiso.content_type.model_class()
+            nombre = modelo._meta.verbose_name_plural.capitalize() if modelo else permiso.content_type.model
+            por_modelo.setdefault(nombre, []).append(ACCIONES_PERMISO.get(accion, accion))
+        filas.append({
+            'nombre': grupo.name,
+            'usuarios': grupo.user_set.filter(is_active=True).order_by('username'),
+            'permisos': sorted(por_modelo.items()),
+            'total': grupo.permissions.count(),
+        })
+    filas.sort(key=lambda fila: PERFILES.index(fila['nombre']))
+    return render(request, 'delegaciones_app/crud/perfiles.html', {'perfiles': filas})

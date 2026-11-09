@@ -1,0 +1,104 @@
+{% extends 'base.html' %}
+
+{% block title %}Resumen Ejecutivo | Municipalidad de La Serena{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <div class="page-kicker">Medición</div>
+        <h1 class="page-title mb-2">Resumen ejecutivo</h1>
+        <p class="page-intro mb-0">Lectura rápida del estado de las delegaciones para acompañar decisiones y priorizar apoyo.</p>
+    </div>
+    <div class="d-flex gap-2">
+        {% if perms.delegaciones_app.add_meta %}<a href="{% url 'mantenedor_nuevo' 'metas' %}" class="btn btn-sgr">+ Agregar meta</a>{% endif %}
+        <a href="{% url 'semaforo' %}" class="btn btn-outline-sgr">Abrir semáforo</a>
+    </div>
+</div>
+{% include 'gestion_app/_filtros.html' %}
+
+{% if periodo %}
+<div class="row g-4 mb-4">
+    <div class="col-md-4">
+        <div class="metric h-100">
+            <div class="card-body">
+                <div class="text-muted">Cumplimiento promedio</div>
+                <h3>{{ promedio }}%</h3>
+                <small>{% if alcanza_umbral %}Alcanza{% else %}No alcanza{% endif %} el umbral colectivo de {{ periodo.umbral_minimo }}%</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="metric navy h-100">
+            <div class="card-body">
+                <div class="text-muted">Mejor delegación</div>
+                <h3>{{ mejor.nombre|default:'-' }}</h3>
+                <small>{{ mejor.cumplimiento|default:'0' }}% de cumplimiento</small>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="metric coral h-100">
+            <div class="card-body">
+                <div class="text-muted">Delegación crítica</div>
+                <h3>{{ critico.nombre|default:'-' }}</h3>
+                <small>{{ critico.cumplimiento|default:'0' }}% de cumplimiento</small>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="table-responsive">
+    <table class="table align-middle panel">
+        <thead>
+            <tr>
+                <th>Delegación</th>
+                <th>Esperado al día</th>
+                <th>Cumplimiento</th>
+                <th>Diferencia</th>
+                <th>Estado</th>
+                <th>Último cálculo</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for delegacion in delegaciones %}
+            <tr class="{% if delegacion.desviacion %}table-{{ delegacion.estado_class }}{% endif %}">
+                <td>{{ delegacion.nombre }}</td>
+                <td>{{ esperado }}%</td>
+                <td>{{ delegacion.cumplimiento }}%</td>
+                <td>{% if delegacion.diferencia != None %}{{ delegacion.diferencia }} puntos{% else %}-{% endif %}</td>
+                <td><span class="badge bg-{{ delegacion.estado_class }} rounded-pill">{{ delegacion.estado }}</span></td>
+                <td>{{ delegacion.ultimos_datos|date:'d-m-Y'|default:'Sin cálculo' }}</td>
+                <td>{% if perms.delegaciones_app.view_meta %}<a class="btn btn-sm btn-outline-sgr" href="{% url 'mantenedor_lista' 'metas' %}?q={{ delegacion.nombre|urlencode }}">Gestionar metas</a>{% endif %}</td>
+            </tr>
+            {% empty %}
+            <tr><td colspan="7" class="text-center py-4">No hay delegaciones con metas para este criterio de búsqueda.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+<section class="mt-5">
+    <div class="section-label">Datos migrados</div>
+    <h2 class="h4 mb-3">Histórico reportado por delegación</h2>
+    <div class="table-responsive">
+        <table class="table align-middle panel">
+            <thead><tr><th>Delegación</th><th>Fecha de datos</th><th>Meta</th><th>Cumplimiento</th><th>Estado reportado</th><th>Observación</th></tr></thead>
+            <tbody>
+                {% for medicion in mediciones_historicas %}
+                <tr>
+                    <td>{{ medicion.delegacion.nombre }}</td>
+                    <td>{{ medicion.fecha_datos|date:'d-m-Y' }}</td>
+                    <td>{{ medicion.meta }}%</td>
+                    <td>{{ medicion.cumplimiento }}%</td>
+                    <td>{{ medicion.get_estado_reportado_display }}</td>
+                    <td>{{ medicion.observacion|default:'-' }}</td>
+                </tr>
+                {% empty %}
+                <tr><td colspan="6" class="text-center py-4">Aún no hay mediciones históricas.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}

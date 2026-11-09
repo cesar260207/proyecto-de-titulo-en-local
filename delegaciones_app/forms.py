@@ -1,0 +1,436 @@
+from django import forms
+from django.contrib.auth.models import Group, User
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+
+from .models import Actividad, Ajuste, Ausencia, Cargo, CasoSocial, Catalogo, Comentario, Compromiso, Delegacion, Evidencia, Funcionario, ItemMedible, Meta, Organizacion, ParametroVersionado, Periodo, Rol, VersionOptimistaMixin
+from .permisos import (
+    ADMINISTRADOR, COORDINADOR, DELEGADO, PERFIL_ADMINISTRADOR, PERFIL_FUNCIONARIO, PERFILES, ROLES_DEL_SISTEMA, asignar_perfil,
+    funcionario_de, perfil_sugerido, puede_ver_todo,
+)
+
+
+class FormularioBootstrap:
+    """Agrega las clases de Bootstrap a los widgets de un formulario."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for campo in self.fields.values():
+            widget = campo.widget
+            if isinstance(widget, forms.CheckboxInput):
+                clase = 'form-check-input'
+            elif isinstance(widget, forms.Select):
+                clase = 'form-select'
+            else:
+                clase = 'form-control'
+            widget.attrs['class'] = f"{widget.attrs.get('class', '')} {clase}".strip()
+
+
+class DelegacionForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Delegacion
+        fields = ['nombre', 'ambito', 'enfasis', 'estado']
+        labels = {'ambito': 'Ámbito', 'enfasis': 'Énfasis', 'estado': 'Delegación activa'}
+        widgets = {'enfasis': forms.Textarea(attrs={'rows': 4})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['enfasis'].required = False
+
+
+class CargoForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Cargo
+        fields = ['nombre', 'vigencia']
+        labels = {'vigencia': 'Cargo vigente'}
+
+
+class RolForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Rol
+        fields = ['nombre_rol']
+        labels = {'nombre_rol': 'Nombre del rol'}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk and self.instance.nombre_rol in ROLES_DEL_SISTEMA:
+            self.fields['nombre_rol'].disabled = True
+            self.fields['nombre_rol'].help_text = 'Es un rol del sistema: los permisos lo consultan por su nombre y no se renombra.'
+
+
+class FuncionarioForm(FormularioBootstrap, forms.ModelForm):
+    """Alta y edición de un Funcionario junto con su cuenta de acceso, su perfil (grupo de Django) y sus roles."""
+
+    campos_sin_auditar = ('password', 'password_confirm')
+
+    username = forms.CharField(max_length=150, label='Nombre de usuario', help_text='Es también el identificador institucional.', widget=forms.TextInput(attrs={'autocomplete': 'username'}))
+    email = forms.EmailField(required=False, label='Correo electrónico', widget=forms.EmailInput(attrs={'autocomplete': 'email'}))
+    perfil = forms.ModelChoiceField(
+        queryset=Group.objects.filter(name__in=PERFILES).order_by('name'), required=False, label='Perfil de acceso',
+        empty_label='Según sus roles',
+        help_text='Administrador: acceso total y gestión de usuarios. Coordinador: mantenedores operativos, transacciones y '
+                  'revisión en todas las delegaciones. Delegado: revisa evidencias y trabaja su delegación. Funcionario: '
+                  'solo sus actividades, evidencias y tareas. Si lo dejas vacío, se deduce de los roles.',
+    )
+    roles = forms.ModelMultipleChoiceField(queryset=Rol.objects.all(), label='Roles', help_text='Mantén Ctrl presionado para elegir más de uno.')
+    password = forms.CharField(required=False, label='Contraseña', widget=forms.PasswordInput(attrs={'autocomplete': 'new-password'}), help_text='Obligatoria al crear. Déjala vacía al editar para conservar la actual.')
+    password_confirm = forms.CharField(required=False, label='Confirmar contraseña', widget=forms.PasswordInput(attrs={'autocomplete': 'new-password'}))
+
+    class Meta:
+        model = Funcionario
+        fields = ['nombre', 'cargo', 'delegacion', 'estado']
+        labels = {'cargo': 'Cargo', 'delegacion': 'Delegación', 'estado': 'Cuenta activa'}
+        help_texts = {'delegacion': 'Déjala vacía para roles de alcance global (administrador, coordinador).'}
+
+    field_order = ['username', 'nombre', 'email', 'cargo', 'delegacion', 'perfil', 'roles', 'estado', 'password', 'password_confirm']
+
+    def __init__(self, *args, actor=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.actor = actor
+        # Solo cargos vigentes y delegaciones activas; al editar se conserva la actual aunque se haya desactivado.
+        self.fields['cargo'].queryset = Cargo.objects.filter(Q(vigencia=True) | Q(pk=self.instance.cargo_id))
+        self.fields['delegacion'].queryset = Delegacion.objects.filter(Q(estado=True) | Q(pk=self.instance.delegacion_id))
+        if self.instance.pk:
+            usuario = self.instance.usuario
+            self.fields['username'].initial = usuario.username
+            self.fields['email'].initial = usuario.email
+            self.fields['roles'].initial = self.instance.roles.all()
+            self.fields['perfil'].initial = usuario.groups.filter(name__in=PERFILES).values_list('pk', flat=True).first()
+        else:
+            self.fields['password'].required = True
+            self.fields['password_confirm'].required = True
+
+    def clean_username(self):
+        username = self.cleaned_data['username']
+        usuarios = User.objects.filter(username__iexact=username)
+        funcionarios = Funcionario.objects.filter(identificador_institucional__iexact=username)
+        if self.instance.pk:
+            usuarios = usuarios.exclude(pk=self.instance.usuario_id)
+            funcionarios = funcionarios.exclude(pk=self.instance.pk)
+        if usuarios.exists() or funcionarios.exists():
+            raise forms.ValidationError('Ya existe una cuenta con este nombre de usuario.')
+        return username
+
+    def clean(self):
+        cleaned_data = super().clean()
+        password = cleaned_data.get('password')
+        if password != cleaned_data.get('password_confirm'):
+            self.add_error('password_confirm', 'Las contraseñas no coinciden.')
+        if password:
+            usuario = User(username=cleaned_data.get('username', ''), first_name=cleaned_data.get('nombre', ''))
+            try:
+                validate_password(password, usuario)
+            except ValidationError as error:
+                self.add_error('password', error)
+        if self.instance.pk and self.actor and self.instance.usuario_id == self.actor.pk:
+            if cleaned_data.get('estado') is False:
+                self.add_error('estado', 'No puedes desactivar tu propia cuenta.')
+            roles = cleaned_data.get('roles')
+            if roles is not None and self.instance.roles.filter(nombre_rol=ADMINISTRADOR).exists() and not any(rol.nombre_rol == ADMINISTRADOR for rol in roles):
+                self.add_error('roles', 'No puedes quitarte el rol administrador.')
+            perfil = cleaned_data.get('perfil')
+            if perfil and perfil.name != PERFIL_ADMINISTRADOR and self.instance.usuario.groups.filter(name=PERFIL_ADMINISTRADOR).exists():
+                self.add_error('perfil', 'No puedes quitarte el perfil Administrador.')
+        self._validar_perfil_y_roles(cleaned_data)
+        return cleaned_data
+
+    def _validar_perfil_y_roles(self, cleaned_data):
+        """El perfil no puede dar menos alcance que los roles: un administrador o coordinador
+        con perfil Funcionario tendría el alcance de su rol sin los permisos para usarlo."""
+        perfil, roles = cleaned_data.get('perfil'), cleaned_data.get('roles')
+        if not perfil or roles is None:
+            return
+        nombres = {rol.nombre_rol for rol in roles}
+        if ADMINISTRADOR in nombres and perfil.name != PERFIL_ADMINISTRADOR:
+            self.add_error('perfil', 'El rol administrador requiere el perfil Administrador.')
+        elif COORDINADOR in nombres and perfil.name not in PERFILES[:2]:
+            self.add_error('perfil', 'El rol coordinador requiere el perfil Coordinador o Administrador.')
+        elif DELEGADO in nombres and perfil.name == PERFIL_FUNCIONARIO:
+            self.add_error('perfil', 'El rol delegado revisa evidencias: requiere el perfil Delegado o uno superior.')
+
+    @transaction.atomic
+    def save(self, commit=True):
+        datos = self.cleaned_data
+        funcionario = super().save(commit=False)
+        usuario = self.instance.usuario if self.instance.pk else User()
+        usuario.username = datos['username']
+        usuario.first_name = datos['nombre'][:150]
+        usuario.email = datos['email']
+        usuario.is_active = datos['estado']
+        if datos.get('password'):
+            usuario.set_password(datos['password'])
+        usuario.save()
+        funcionario.usuario = usuario
+        funcionario.identificador_institucional = usuario.username
+        funcionario.save()
+        funcionario.roles.set(datos['roles'])
+        asignar_perfil(usuario, datos.get('perfil') or perfil_sugerido({rol.nombre_rol for rol in datos['roles']}))
+        return funcionario
+
+
+class CatalogoForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Catalogo
+        fields = ['codigo', 'nombre', 'tipo', 'subtipo', 'area', 'activo']
+        labels = {'codigo': 'Código', 'activo': 'Elemento activo'}
+        help_texts = {'codigo': 'Debe ser único en todo el catálogo.'}
+
+
+class OrganizacionForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Organizacion
+        fields = ['nombre', 'tipo', 'personalidad_juridica', 'domicilio', 'territorio', 'delegacion', 'verificada', 'observaciones', 'activa']
+        labels = {'personalidad_juridica': 'Personalidad jurídica', 'verificada': 'Registro verificado', 'activa': 'Organización activa'}
+        widgets = {'observaciones': forms.Textarea(attrs={'rows': 3})}
+
+
+class ParametroVersionadoForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = ParametroVersionado
+        fields = ['periodo', 'clave', 'valor', 'descripcion']
+        widgets = {'descripcion': forms.Textarea(attrs={'rows': 3})}
+
+
+class PeriodoForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Periodo
+        fields = ['nombre', 'fecha_inicio', 'fecha_termino', 'umbral_minimo']
+        labels = {'nombre': 'Nombre del período', 'fecha_inicio': 'Fecha de inicio', 'fecha_termino': 'Fecha de término', 'umbral_minimo': 'Umbral colectivo (%)'}
+        help_texts = {'umbral_minimo': 'Porcentaje mínimo para considerar cumplida la meta colectiva.'}
+        widgets = {
+            'fecha_inicio': forms.DateInput(attrs={'type': 'date'}),
+            'fecha_termino': forms.DateInput(attrs={'type': 'date'}),
+            'umbral_minimo': forms.NumberInput(attrs={'min': 0, 'max': 100, 'step': '0.01'}),
+        }
+
+    def clean_umbral_minimo(self):
+        valor = self.cleaned_data['umbral_minimo']
+        if not 0 <= valor <= 100:
+            raise forms.ValidationError('El umbral debe estar entre 0 y 100 %.')
+        return valor
+
+
+class ItemMedibleForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = ItemMedible
+        fields = ['cargo', 'periodo', 'nombre', 'servicio', 'ponderacion', 'tipo_calculo']
+        labels = {'ponderacion': 'Ponderación (%)'}
+        help_texts = {'ponderacion': 'Las ponderaciones de un cargo en un período deben sumar 100 %.'}
+        widgets = {'ponderacion': forms.NumberInput(attrs={'min': 0, 'max': 100, 'step': '0.01'})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['periodo'].queryset = Periodo.objects.exclude(estado='cerrado')
+        if self.instance.pk:
+            # Un ítem no cambia de cargo ni de período una vez creado.
+            self.fields['cargo'].disabled = True
+            self.fields['periodo'].disabled = True
+            self.fields['periodo'].queryset = Periodo.objects.all()
+
+
+class MetaForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Meta
+        fields = ['item', 'funcionario', 'valor_objetivo', 'unidad', 'ponderador']
+        labels = {'item': 'Ítem medible', 'valor_objetivo': 'Valor objetivo', 'ponderador': 'Ponderador (%)'}
+        help_texts = {'valor_objetivo': 'Debe ser mayor que cero.', 'ponderador': 'Peso de la meta en el cumplimiento colectivo.'}
+        widgets = {
+            'valor_objetivo': forms.NumberInput(attrs={'min': 0.01, 'step': '0.01'}),
+            'ponderador': forms.NumberInput(attrs={'min': 0, 'max': 100, 'step': '0.01'}),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['item'].queryset = ItemMedible.objects.exclude(periodo__estado='cerrado').select_related('cargo', 'periodo')
+        self.fields['funcionario'].queryset = Funcionario.objects.filter(Q(estado=True) | Q(pk=self.instance.funcionario_id))
+        if self.instance.pk:
+            self.fields['item'].disabled = True
+            self.fields['item'].queryset = ItemMedible.objects.select_related('cargo', 'periodo')
+
+
+class AsignarDelegadoForm(FormularioBootstrap, forms.Form):
+    """Coordinación: asigna un delegado a una delegación o lo cambia de delegación."""
+
+    funcionario = forms.ModelChoiceField(queryset=Funcionario.objects.none(), label='Delegado')
+    delegacion = forms.ModelChoiceField(queryset=Delegacion.objects.filter(estado=True), label='Delegación')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Solo funcionarios activos con el rol delegado; las delegaciones desactivadas no reciben delegados.
+        self.fields['funcionario'].queryset = Funcionario.objects.filter(estado=True, roles__nombre_rol=DELEGADO).select_related('delegacion').distinct()
+        self.fields['funcionario'].label_from_instance = lambda f: f'{f.nombre} · {f.delegacion or "sin delegación"}'
+
+    def clean(self):
+        cleaned_data = super().clean()
+        funcionario, delegacion = cleaned_data.get('funcionario'), cleaned_data.get('delegacion')
+        if funcionario and delegacion and funcionario.delegacion_id == delegacion.pk:
+            raise forms.ValidationError(f'{funcionario.nombre} ya es delegado de {delegacion}.')
+        return cleaned_data
+
+
+class VersionOptimistaForm:
+    """Campo oculto `version` para el bloqueo optimista (RF-034): si otro usuario guardó antes, se rechaza."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.fields['version'] = forms.IntegerField(widget=forms.HiddenInput, initial=self.instance.version)
+
+    def clean(self):
+        cleaned_data = super().clean()
+        version = cleaned_data.get('version')
+        if self.instance.pk and version is not None and version != self.instance.version:
+            raise ValidationError(VersionOptimistaMixin.MENSAJE_CONCURRENCIA)
+        return cleaned_data
+
+
+class ActividadForm(VersionOptimistaForm, FormularioBootstrap, forms.ModelForm):
+    def __init__(self, *args, user=None, compromisos=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        funcionario = funcionario_de(user) if user else None
+        ve_todo = bool(user) and puede_ver_todo(user)
+        delegaciones, items = Q(estado=True), Q(periodo__estado='abierto')
+        if funcionario and not ve_todo:
+            # Quien tiene delegación registra en la suya, y solo sobre los ítems de su cargo.
+            if funcionario.delegacion_id:
+                delegaciones &= Q(pk=funcionario.delegacion_id)
+            items &= Q(cargo_id=funcionario.cargo_id)
+        # Al editar se conservan los valores actuales aunque luego dejen de estar disponibles.
+        self.fields['delegacion'].queryset = Delegacion.objects.filter(delegaciones | Q(pk=self.instance.delegacion_id))
+        self.fields['item'].queryset = ItemMedible.objects.filter(items | Q(pk=self.instance.item_id)).select_related('cargo', 'periodo')
+        self.fields['catalogo'].queryset = Catalogo.objects.filter(Q(tipo='atencion', activo=True) | Q(pk=self.instance.catalogo_id))
+        self.fields['catalogo'].label_from_instance = lambda elemento: elemento.nombre
+        self.fields['compromiso'].queryset = (compromisos if compromisos is not None else Compromiso.objects.all()).select_related('delegacion')
+        self.fields['organizacion'].queryset = Organizacion.objects.filter(activa=True).order_by('nombre')
+        self.fields['tipo_accion'].required = False
+        self.fields['tipo_accion'].initial = 'ejecucion'
+        for campo in ('item', 'catalogo', 'fecha'):
+            self.fields[campo].required = True
+        self.fields['fecha'].input_formats = ['%Y-%m-%dT%H:%M', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M']
+        if not self.instance.pk:
+            self.fields['fecha'].initial = timezone.localtime().replace(second=0, microsecond=0)
+
+    class Meta:
+        model = Actividad
+        fields = ['delegacion', 'item', 'catalogo', 'fecha', 'solicitud_problema', 'accion', 'contacto_nombre', 'contacto_telefono', 'organizacion', 'tipo_accion', 'compromiso']
+        labels = {
+            'item': 'Ítem de medición', 'catalogo': 'Tipo de atención', 'fecha': 'Fecha y hora',
+            'solicitud_problema': 'Solicitud o problema', 'accion': 'Acción ejecutada',
+            'contacto_nombre': 'Nombre de contacto', 'contacto_telefono': 'Teléfono de contacto', 'compromiso': 'Tarea del tubo de trabajo vinculada (opcional)',
+        }
+        help_texts = {'item': 'Solo ítems de períodos abiertos. La fecha debe caer dentro del período del ítem.'}
+        widgets = {
+            'fecha': forms.DateTimeInput(attrs={'type': 'datetime-local'}, format='%Y-%m-%dT%H:%M'),
+            'solicitud_problema': forms.Textarea(attrs={'rows': 3}),
+            'accion': forms.Textarea(attrs={'rows': 3}),
+        }
+
+
+class EvidenciaForm(FormularioBootstrap, forms.ModelForm):
+    comentario = forms.CharField(required=False, label='Comentario', widget=forms.Textarea(attrs={'rows': 2}))
+
+    class Meta:
+        model = Evidencia
+        fields = ['archivo_vinculo']
+        labels = {'archivo_vinculo': 'Archivo'}
+        help_texts = {'archivo_vinculo': 'Formatos permitidos: JPG, PNG o PDF.'}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['archivo_vinculo'].required = True
+
+
+class RevisionForm(FormularioBootstrap, forms.Form):
+    """Decisión sobre las evidencias pendientes de una actividad: aprobar, o rechazar indicando el motivo (RN-009).
+    La decisión llega en la URL del botón que se pulsó; el motivo, en el formulario."""
+
+    DECISIONES = [('aprobar', 'Aprobar'), ('rechazar', 'Rechazar')]
+    MENSAJE_SIN_MOTIVO = 'El rechazo de una evidencia exige un motivo: quien registró la actividad lo necesita para corregirla.'
+
+    decision = forms.ChoiceField(choices=DECISIONES)
+    observacion = forms.CharField(
+        label='Motivo u observación', required=False, max_length=1000,
+        widget=forms.Textarea(attrs={'class': 'mb-3', 'rows': 2, 'placeholder': 'Obligatorio para rechazar'}),
+    )
+
+    def clean(self):
+        cleaned_data = super().clean()
+        if cleaned_data.get('decision') == 'rechazar' and not cleaned_data.get('observacion'):
+            self.add_error('observacion', self.MENSAJE_SIN_MOTIVO)
+        return cleaned_data
+
+
+class CompromisoForm(VersionOptimistaForm, FormularioBootstrap, forms.ModelForm):
+    def __init__(self, *args, user=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        funcionario = funcionario_de(user) if user else None
+        ve_todo = bool(user) and puede_ver_todo(user)
+        delegaciones, responsables = Q(estado=True), Q(estado=True)
+        if funcionario and funcionario.delegacion_id and not ve_todo:
+            delegaciones &= Q(pk=funcionario.delegacion_id)
+            responsables = Q(pk=funcionario.pk)
+        self.fields['delegacion'].queryset = Delegacion.objects.filter(delegaciones | Q(pk=self.instance.delegacion_id))
+        self.fields['funcionario_responsable'].queryset = Funcionario.objects.filter(responsables | Q(pk=self.instance.funcionario_responsable_id)).select_related('delegacion')
+        self.fields['funcionario_responsable'].label_from_instance = lambda f: f'{f.nombre} · {f.delegacion or "sin delegación"}'
+        if ve_todo:
+            self.fields['funcionario_responsable'].label = 'Delegado responsable'
+            self.fields['funcionario_responsable'].help_text = 'La coordinación asigna la tarea a un delegado de la delegación elegida.'
+        self.fields['item'].queryset = ItemMedible.objects.exclude(periodo__estado='cerrado').select_related('cargo', 'periodo')
+        for campo in ('funcionario_responsable', 'origen'):
+            self.fields[campo].required = True
+        self.fields['origen'].initial = 'externo'
+        if self.instance.pk:
+            # El estado cambia con las acciones de la agenda, que dejan su historial.
+            del self.fields['estado']
+
+    def clean(self):
+        cleaned_data = super().clean()
+        delegacion, responsable = cleaned_data.get('delegacion'), cleaned_data.get('funcionario_responsable')
+        if delegacion and responsable and responsable.delegacion_id and responsable.delegacion_id != delegacion.pk:
+            self.add_error('funcionario_responsable', f'{responsable.nombre} pertenece a la delegación {responsable.delegacion}, no a {delegacion}.')
+        return cleaned_data
+
+    class Meta:
+        model = Compromiso
+        fields = ['delegacion', 'funcionario_responsable', 'origen', 'solicitante', 'solicitante_telefono', 'territorio', 'organizacion', 'eje', 'descripcion', 'fecha_comprometida', 'area_apoyo', 'item', 'estado', 'observacion']
+
+
+class AjusteForm(FormularioBootstrap, forms.ModelForm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['respaldo'].required = True
+
+    class Meta:
+        model = Ajuste
+        fields = ['tipo', 'origen', 'emisor', 'funcionario', 'delegacion', 'periodo', 'fecha', 'respaldo', 'observacion']
+        widgets = {'fecha': forms.DateInput(attrs={'type': 'date'}), 'observacion': forms.Textarea(attrs={'rows': 3})}
+
+
+class AusenciaForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Ausencia
+        fields = ['funcionario', 'periodo', 'tipo', 'desde', 'hasta', 'observacion']
+        widgets = {
+            'desde': forms.DateInput(attrs={'type': 'date'}),
+            'hasta': forms.DateInput(attrs={'type': 'date'}),
+            'observacion': forms.Textarea(attrs={'rows': 3}),
+        }
+
+
+class CasoSocialForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = CasoSocial
+        fields = ['nombre_usuario', 'telefono_usuario', 'etapa', 'tipo', 'subtipo', 'observacion']
+        widgets = {'observacion': forms.Textarea(attrs={'rows': 3})}
+
+
+class ComentarioForm(FormularioBootstrap, forms.ModelForm):
+    class Meta:
+        model = Comentario
+        fields = ['contenido']
+        widgets = {'contenido': forms.Textarea(attrs={'rows': 3})}
+        labels = {'funcionario_responsable': 'Responsable', 'area_apoyo': 'Área de apoyo', 'item': 'Ítem medible (opcional)'}
+        widgets = {'fecha_comprometida': forms.DateInput(attrs={'type': 'date'}), 'descripcion': forms.Textarea(attrs={'rows': 3}), 'observacion': forms.Textarea(attrs={'rows': 2})}
